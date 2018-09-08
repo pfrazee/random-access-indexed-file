@@ -39,6 +39,7 @@ function RandomAccessNonsparseFile (filename, opts) {
   this.contentFd = 0
   this.indexFilename = filename + '.index'
   this.indexFd = 0
+  this.nextAvailableBlock = 0
 
   // makes random-access-storage open in writable mode first
   if (opts.writable) this.preferReadonly = false
@@ -235,15 +236,16 @@ async function safeClose (self, fdname) {
 
 async function allocatePointer (self, offset) {
   // find the next available block
-  var st = await fsp.fstat(self.contentFd)
-  var pointer = (st.size + self._blockSize - (st.size % self._blockSize))
-  // ^ we find the next available block, and never use block 0 (that's special cased)
-
-  // write the pointer
-  var res = await fsp.write(self.indexFd, uint48be.encode(pointer), 0, 6, Math.floor(offset / self._blockSize) * 6)
-  if (res.bytesWritten !== 6) {
-    throw new Error('Failed to write index')
+  if (!self.nextAvailableBlock) {
+    self.nextAvailableBlock = await readIndexValue(self, 0)
   }
+  var pointer = (++self.nextAvailableBlock) * self._blockSize
+
+  // update the index file
+  await Promise.all([
+    writeIndexValue(self, 0, pointer), // the last used block
+    writeIndexValue(self, Math.floor(offset / self._blockSize), pointer) // the pointer
+  ])
 
   // return the pointer
   var blockOffset = offset % self._blockSize
@@ -273,10 +275,7 @@ async function readPointer (self, offset) {
   await acquireBlockLock.acquireAsync()
   try {
     // read the pointer
-    var buf = Buffer.alloc(6)
-    var res = await fsp.read(self.indexFd, buf, 0, 6, Math.floor(offset / self._blockSize) * 6)
-    if (res.bytesRead !== 6) return null // no data received
-    var pointer = uint48be.decode(buf)
+    var pointer = await readIndexValue(self, Math.floor(offset / self._blockSize))
     if (!pointer) return null // no pointer assigned
 
     var blockOffset = offset % self._blockSize
@@ -286,6 +285,22 @@ async function readPointer (self, offset) {
     }
   } finally {
     acquireBlockLock.release()
+  }
+}
+
+async function readIndexValue (self, slot) {
+  var buf = Buffer.alloc(6)
+  var res = await fsp.read(self.indexFd, buf, 0, 6, slot * 6)
+  if (res.bytesRead !== 6) return 0 // no data received
+  var value = uint48be.decode(buf)
+  if (!value) return 0 // no pointer assigned
+  return value
+}
+
+async function writeIndexValue (self, slot, value) {
+  var res = await fsp.write(self.indexFd, uint48be.encode(value), 0, 6, slot * 6)
+  if (res.bytesWritten !== 6) {
+    throw new Error('Failed to write index')
   }
 }
 

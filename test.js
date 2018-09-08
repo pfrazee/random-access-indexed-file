@@ -79,6 +79,26 @@ tape('random access write and read', function (t) {
   })
 })
 
+tape('write on block boundary', function (t) {
+  var file = raif(gen(), {blockSize: 3})
+
+  file.write(9, Buffer.from('hi'), function (err) {
+    t.error(err, 'no error')
+    file.write(3, Buffer.from('aaabbb'), function (err) {
+      t.error(err, 'no error')
+      file.read(9, 2, function (err, buf) {
+        t.error(err, 'no error')
+        t.same(buf, Buffer.from('hi'))
+        file.read(3, 6, function (err, buf) {
+          t.error(err, 'no error')
+          t.same(buf, Buffer.from('aaabbb'))
+          t.end()
+        })
+      })
+    })
+  })
+})
+
 tape('random access write and read across blocks', function (t) {
   var file = raif(gen(), {blockSize: 6})
 
@@ -227,6 +247,31 @@ tape('rmdir option', function (t) {
       t.end()
     })
   }
+})
+
+tape('write/read big chunks with overlap', function (t) {
+  var file = raif(gen())
+  var bigBuffer = Buffer.alloc(10 * 1024 * 1024)
+  var missing = 2
+
+  bigBuffer.fill('hey. hey. how are you doing?. i am good thanks how about you? i am good')
+
+  file.write(0, bigBuffer, function (err) {
+    t.error(err, 'no error')
+    file.read(0, bigBuffer.length, function (err, buf) {
+      t.error(err, 'no error')
+      t.same(buf, bigBuffer)
+
+      file.write(50, bigBuffer, function (err) {
+        t.error(err, 'no error')
+        file.read(50, bigBuffer.length, function (err, buf) {
+          t.error(err, 'no error')
+          t.same(buf, bigBuffer)
+          file.destroy(() => t.end())
+        })
+      })
+    })
+  })
 })
 
 tape('rmdir option with non empty parent', function (t) {
