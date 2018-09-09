@@ -1,8 +1,8 @@
-var inherits = require('util').inherits
-var promisify = require('util').promisify
-var RandomAccess = require('random-access-storage')
-var fs = require('fs')
-var fsp = {
+const inherits = require('util').inherits
+const promisify = require('util').promisify
+const RandomAccess = require('random-access-storage')
+const fs = require('fs')
+const fsp = {
   open: promisify(fs.open),
   close: promisify(fs.close),
   unlink: promisify(fs.unlink),
@@ -12,18 +12,21 @@ var fsp = {
   write: promisify(fs.write),
   ftruncate: promisify(fs.ftruncate)
 }
-var mkdirp = require('mkdirp')
-var path = require('path')
-var uint48be = require('uint48be')
-var AwaitLock = require('await-lock')
-var constants = fs.constants || require('constants')
+const mkdirp = require('mkdirp')
+const path = require('path')
+const uint48be = require('uint48be')
+const AwaitLock = require('await-lock')
+const constants = fs.constants || require('constants')
 
-var READONLY = constants.O_RDONLY
-var READWRITE = constants.O_RDWR | constants.O_CREAT
+const READONLY = constants.O_RDONLY
+const READWRITE = constants.O_RDWR | constants.O_CREAT
 
-var DEFAULT_BLOCK_SIZE = 1024 // 1mb
+const DEFAULT_BLOCK_SIZE = 1024 * 1024 // 1mb, in bytes
+const BLOCK_SIZE_SLOT = 0
+const NEXT_PTR_SLOT = 1
+const OFFSET_TO_SLOT = (offset, blockSize) => Math.floor(offset / blockSize) + 2
 
-var acquireBlockLock = new AwaitLock()
+const acquireBlockLock = new AwaitLock()
 
 module.exports = RandomAccessNonsparseFile
 
@@ -39,7 +42,7 @@ function RandomAccessNonsparseFile (filename, opts) {
   this.contentFd = 0
   this.indexFilename = filename + '.index'
   this.indexFd = 0
-  this.nextAvailableBlock = 0
+  this._nextPtr = 0
 
   // makes random-access-storage open in writable mode first
   if (opts.writable) this.preferReadonly = false
@@ -71,9 +74,14 @@ RandomAccessNonsparseFile.prototype._write = async function (req) {
   try {
     while (req.size) {
       // read/create the pointer
-      var ptr = await readPointer(this, req.offset)
-      if (!ptr) {
-        ptr = await allocatePointer(this, req.offset)
+      try {
+        await acquireBlockLock.acquireAsync()
+        var ptr = await readPointer(this, req.offset)
+        if (!ptr) {
+          ptr = await allocatePointer(this, req.offset)
+        }
+      } finally {
+        acquireBlockLock.release()
       }
 
       // cap the size by the blocksize
@@ -218,6 +226,19 @@ async function open (self, mode, req) {
       // therefore we should fallback into RAF behavior
     }
 
+    if (self.indexFd) {
+      if (isContentFileNew) {
+        // write the index header
+        self._nextPtr = self._blockSize
+        await writeIndexSlot(self, BLOCK_SIZE_SLOT, self._blockSize)
+        await writeIndexSlot(self, NEXT_PTR_SLOT, self._nextPtr)
+      } else {
+        // read the index header
+        self._blockSize = await readIndexSlot(self, BLOCK_SIZE_SLOT)
+        self._nextPtr = await readIndexSlot(self, NEXT_PTR_SLOT)
+      }
+    }
+
     req.callback(null)
   } catch (err) {
     await safeClose(self, 'indexFd')
@@ -235,17 +256,13 @@ async function safeClose (self, fdname) {
 }
 
 async function allocatePointer (self, offset) {
-  // find the next available block
-  if (!self.nextAvailableBlock) {
-    self.nextAvailableBlock = await readIndexValue(self, 0)
-  }
-  var pointer = (++self.nextAvailableBlock) * self._blockSize
+  // allocate the next available block pointer
+  var pointer = self._nextPtr
+  self._nextPtr += self._blockSize
 
   // update the index file
-  await Promise.all([
-    writeIndexValue(self, 0, pointer), // the last used block
-    writeIndexValue(self, Math.floor(offset / self._blockSize), pointer) // the pointer
-  ])
+  await writeIndexSlot(self, NEXT_PTR_SLOT, self._nextPtr)
+  await writeIndexSlot(self, OFFSET_TO_SLOT(offset, self._blockSize), pointer)
 
   // return the pointer
   var blockOffset = offset % self._blockSize
@@ -272,23 +289,18 @@ async function readPointer (self, offset) {
     return {fileOffset: offset, blockOffset: offset}
   }
 
-  await acquireBlockLock.acquireAsync()
-  try {
-    // read the pointer
-    var pointer = await readIndexValue(self, Math.floor(offset / self._blockSize))
-    if (!pointer) return null // no pointer assigned
+  // read the pointer
+  var pointer = await readIndexSlot(self, OFFSET_TO_SLOT(offset, self._blockSize))
+  if (!pointer) return null // no pointer assigned
 
-    var blockOffset = offset % self._blockSize
-    return {
-      fileOffset: pointer + blockOffset, // where in the content file to read
-      blockOffset // where within the block are we reading?
-    }
-  } finally {
-    acquireBlockLock.release()
+  var blockOffset = offset % self._blockSize
+  return {
+    fileOffset: pointer + blockOffset, // where in the content file to read
+    blockOffset // where within the block are we reading?
   }
 }
 
-async function readIndexValue (self, slot) {
+async function readIndexSlot (self, slot) {
   var buf = Buffer.alloc(6)
   var res = await fsp.read(self.indexFd, buf, 0, 6, slot * 6)
   if (res.bytesRead !== 6) return 0 // no data received
@@ -297,7 +309,7 @@ async function readIndexValue (self, slot) {
   return value
 }
 
-async function writeIndexValue (self, slot, value) {
+async function writeIndexSlot (self, slot, value) {
   var res = await fsp.write(self.indexFd, uint48be.encode(value), 0, 6, slot * 6)
   if (res.bytesWritten !== 6) {
     throw new Error('Failed to write index')
